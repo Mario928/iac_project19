@@ -62,16 +62,13 @@ resource "openstack_compute_instance_v2" "main_vm" {
   EOF
 }
 
-// CHOOSE ONE OF THE BLOCKS BELOW:
-
 // ====================================================================
 // FIRST-TIME RUN - USE THIS BLOCK:
-// Uncomment the floating IP resource and comment the rest
 // ====================================================================
-/*
+
 resource "openstack_networking_floatingip_v2" "main_vm_floating_ip" {
   pool        = "public"
-  description = "Floating IP for main-vm-${var.suffix}"
+  description = "main-vm-floating-ip-${var.suffix}"  // Updated description with suffix
   port_id     = openstack_networking_port_v2.main_vm_port.id
 }
 
@@ -84,6 +81,11 @@ output "vm_name" {
 output "network_port_name" {
   description = "Name of the network port"
   value       = openstack_networking_port_v2.main_vm_port.name
+}
+
+output "floating_ip_description" {
+  description = "Description of the floating IP"
+  value       = openstack_networking_floatingip_v2.main_vm_floating_ip.description
 }
 
 output "floating_ip_address" {
@@ -100,13 +102,14 @@ output "ssh_command" {
   description = "SSH command to connect to the VM"
   value       = "ssh cc@${openstack_networking_floatingip_v2.main_vm_floating_ip.address}"
 }
-*/
 
 // ====================================================================
 // SUBSEQUENT RUNS - USE THIS BLOCK:
 // Keep your floating IP from being destroyed
+// COMMENT OUT THIS SECTION FOR NOW
 // ====================================================================
 
+/*
 variable "floating_ip_address" {
   description = "Existing floating IP to use"
   default     = "129.114.27.7"  // Update this with your actual IP after first run
@@ -151,3 +154,4 @@ output "ssh_command" {
   description = "SSH command to connect to the VM"
   value       = "ssh cc@${data.openstack_networking_floatingip_v2.existing_ip.address}"
 }
+*/
