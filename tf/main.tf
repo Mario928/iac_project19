@@ -1,4 +1,5 @@
 // TERRAFORM VERSION AND PROVIDER REQUIREMENTS
+// We define Terraform's provider settings to ensure compatibility with ChameleonCloud's OpenStack environment.
 terraform {
   required_version = ">= 0.14.0"
   required_providers {
@@ -10,24 +11,26 @@ terraform {
 }
 
 // PROVIDER CONFIGURATION
+// This tells Terraform to use OpenStack and look for auth details in clouds.yaml file.
 provider "openstack" {
   cloud = "openstack"
 }
 
 // VARIABLES
 variable "suffix" {
-  description = "Suffix for resource names"
+  description = "Suffix to differentiate resources"
   type        = string
-  nullable = false
+  nullable    = false
 }
 
 variable "key" {
-  description = "Name of key pair"
+  description = "Name of the SSH key pair registered in Chameleon"
   type        = string
   default     = "id_rsa_chameleon"
 }
 
 // DATA SOURCES
+// Fetch the public shared network and security groups pre-configured in Chameleon.
 data "openstack_networking_network_v2" "sharednet3" {
   name = "sharednet3"
 }
@@ -36,25 +39,46 @@ data "openstack_networking_secgroup_v2" "allow_ssh" {
   name = "allow-ssh"
 }
 
-// MAIN RESOURCES
-resource "openstack_networking_port_v2" "main_vm_port" {
-  name            = "main-vm-port-${var.suffix}"
-  network_id      = data.openstack_networking_network_v2.sharednet3.id
+// ADDITIONAL SECURITY GROUPS
+// These are required to expose services like MLFlow (port 8000) and MinIO (ports 9000, 9001)
+data "openstack_networking_secgroup_v2" "allow_8000" {
+  name = "allow-8000"
+}
+
+data "openstack_networking_secgroup_v2" "allow_9000" {
+  name = "allow-9000"
+}
+
+data "openstack_networking_secgroup_v2" "allow_9001" {
+  name = "allow-9001"
+}
+
+// NETWORKING PORT
+// This is the network interface for VM. We attach only the necessary security groups.
+resource "openstack_networking_port_v2" "main-vm-port-${var.suffix}" {
+  name       = "main-vm-port-${var.suffix}"
+  network_id = data.openstack_networking_network_v2.sharednet3.id
   security_group_ids = [
-    data.openstack_networking_secgroup_v2.allow_ssh.id
+    data.openstack_networking_secgroup_v2.allow_ssh.id,
+    data.openstack_networking_secgroup_v2.allow_8000.id,
+    data.openstack_networking_secgroup_v2.allow_9000.id,
+    data.openstack_networking_secgroup_v2.allow_9001.id,
   ]
 }
 
-resource "openstack_compute_instance_v2" "main_vm" {
+// COMPUTE INSTANCE
+// We spin up one CPU VM (no GPU needed for inference) on sharednet3, accessible via floating IP.
+resource "openstack_compute_instance_v2" "main-vm-${var.suffix}" {
   name        = "main-vm-${var.suffix}"
   image_name  = "CC-Ubuntu24.04"
-  flavor_name = "m1.medium"
+  flavor_name = "m1.medium" // Suitable for CPU-based inference
   key_pair    = var.key
 
   network {
-    port = openstack_networking_port_v2.main_vm_port.id
+    port = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
   }
 
+  // User data for first-boot initialization (load SSH keys, register hostname)
   user_data = <<-EOF
     #! /bin/bash
     sudo echo "127.0.1.1 main-vm-${var.suffix}" >> /etc/hosts
@@ -62,96 +86,62 @@ resource "openstack_compute_instance_v2" "main_vm" {
   EOF
 }
 
-// ====================================================================
-// FIRST-TIME RUN - USE THIS BLOCK:
-// ====================================================================
-
-resource "openstack_networking_floatingip_v2" "main_vm_floating_ip" {
+// FLOATING IP - FIRST TIME ONLY
+// This block creates a public IP and assigns it to VM so we can SSH or access APIs.
+resource "openstack_networking_floatingip_v2" "main-vm-floating-ip-${var.suffix}" {
   pool        = "public"
-  description = "main-vm-floating-ip-${var.suffix}"  // Updated description with suffix
-  port_id     = openstack_networking_port_v2.main_vm_port.id
+  description = "Floating IP for main-vm-${var.suffix}"
+  port_id     = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
+}
+
+// OBJECT STORAGE CONTAINER (Swift)
+// This creates a Swift container for storing datasets or model artifacts.
+resource "openstack_objectstorage_container_v1" "objectstore-container-${var.suffix}" {
+  name = "objectstore-container-${var.suffix}"
+}
+
+// BLOCK STORAGE VOLUME (Cinder)
+// This defines a 20GB persistent volume in the KVM@TACC zone.
+resource "openstack_blockstorage_volume_v3" "blockstorage-volume-${var.suffix}" {
+  name              = "blockstorage-volume-${var.suffix}"
+  size              = 20
+  availability_zone = "KVM@TACC"
+}
+
+// ATTACH VOLUME TO VM
+// This attaches the block volume to the instance so it can be mounted in the OS.
+resource "openstack_compute_volume_attach_v2" "blockstorage-volume-attach-${var.suffix}" {
+  instance_id = openstack_compute_instance_v2["main-vm-${var.suffix}"].id
+  volume_id   = openstack_blockstorage_volume_v3["blockstorage-volume-${var.suffix}"].id
 }
 
 // OUTPUTS FOR FIRST-TIME RUN
 output "vm_name" {
-  description = "Name of the VM"
-  value       = openstack_compute_instance_v2.main_vm.name
+  value       = openstack_compute_instance_v2["main-vm-${var.suffix}"].name
+  description = "Name of the deployed VM"
 }
 
 output "network_port_name" {
-  description = "Name of the network port"
-  value       = openstack_networking_port_v2.main_vm_port.name
-}
-
-output "floating_ip_description" {
-  description = "Description of the floating IP"
-  value       = openstack_networking_floatingip_v2.main_vm_floating_ip.description
+  value       = openstack_networking_port_v2["main-vm-port-${var.suffix}"].name
+  description = "Name of the VM's network port"
 }
 
 output "floating_ip_address" {
-  description = "Floating IP address"
-  value       = openstack_networking_floatingip_v2.main_vm_floating_ip.address
-}
-
-output "network_name" {
-  description = "Name of connected network"
-  value       = data.openstack_networking_network_v2.sharednet3.name
+  value       = openstack_networking_floatingip_v2["main-vm-floating-ip-${var.suffix}"].address
+  description = "Public IP to reach the VM"
 }
 
 output "ssh_command" {
+  value       = "ssh cc@${openstack_networking_floatingip_v2["main-vm-floating-ip-${var.suffix}"].address}"
   description = "SSH command to connect to the VM"
-  value       = "ssh cc@${openstack_networking_floatingip_v2.main_vm_floating_ip.address}"
 }
 
-// ====================================================================
-// SUBSEQUENT RUNS - USE THIS BLOCK:
-// Keep your floating IP from being destroyed
-// COMMENT OUT THIS SECTION FOR NOW
-// ====================================================================
-
-/*
-variable "floating_ip_address" {
-  description = "Existing floating IP to use"
-  default     = "129.114.27.7"  // Update this with your actual IP after first run
+output "object_storage_container" {
+  value       = openstack_objectstorage_container_v1["objectstore-container-${var.suffix}"].name
+  description = "Name of the created Swift object storage container"
 }
 
-data "openstack_networking_floatingip_v2" "existing_ip" {
-  address = var.floating_ip_address
+output "block_volume_name" {
+  value       = openstack_blockstorage_volume_v3["blockstorage-volume-${var.suffix}"].name
+  description = "Name of the persistent block volume"
 }
-
-resource "openstack_networking_floatingip_associate_v2" "main_vm_fip_association" {
-  floating_ip = data.openstack_networking_floatingip_v2.existing_ip.address
-  port_id     = openstack_networking_port_v2.main_vm_port.id
-}
-
-// OUTPUTS FOR SUBSEQUENT RUNS
-output "vm_name" {
-  description = "Name of the VM"
-  value       = openstack_compute_instance_v2.main_vm.name
-}
-
-output "network_port_name" {
-  description = "Name of the network port"
-  value       = openstack_networking_port_v2.main_vm_port.name
-}
-
-output "floating_ip_address" {
-  description = "Floating IP address"
-  value       = data.openstack_networking_floatingip_v2.existing_ip.address
-}
-
-output "network_name" {
-  description = "Name of connected network"
-  value       = data.openstack_networking_network_v2.sharednet3.name
-}
-
-output "security_group" {
-  description = "Security group applied"
-  value       = data.openstack_networking_secgroup_v2.allow_ssh.name
-}
-
-output "ssh_command" {
-  description = "SSH command to connect to the VM"
-  value       = "ssh cc@${data.openstack_networking_floatingip_v2.existing_ip.address}"
-}
-*/
