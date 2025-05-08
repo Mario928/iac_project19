@@ -1,5 +1,4 @@
 // TERRAFORM VERSION AND PROVIDER REQUIREMENTS
-// We define Terraform's provider settings to ensure compatibility with ChameleonCloud's OpenStack environment.
 terraform {
   required_version = ">= 0.14.0"
   required_providers {
@@ -10,10 +9,14 @@ terraform {
   }
 }
 
-// PROVIDER CONFIGURATION
-// This tells Terraform to use OpenStack and look for auth details in clouds.yaml file.
+// PROVIDERS
 provider "openstack" {
-  cloud = "openstack"
+  cloud = "openstack_kvm"
+}
+
+provider "openstack" {
+  alias = "swift"
+  cloud = "openstack_chi"
 }
 
 // VARIABLES
@@ -30,7 +33,6 @@ variable "key" {
 }
 
 // DATA SOURCES
-// Fetch the public shared network and security groups pre-configured in Chameleon.
 data "openstack_networking_network_v2" "sharednet3" {
   name = "sharednet3"
 }
@@ -39,8 +41,6 @@ data "openstack_networking_secgroup_v2" "allow_ssh" {
   name = "allow-ssh"
 }
 
-// ADDITIONAL SECURITY GROUPS
-// These are required to expose services like MLFlow (port 8000) and MinIO (ports 9000, 9001)
 data "openstack_networking_secgroup_v2" "allow_8000" {
   name = "allow-8000"
 }
@@ -54,7 +54,6 @@ data "openstack_networking_secgroup_v2" "allow_9001" {
 }
 
 // NETWORKING PORT
-// This is the network interface for VM. We attach only the necessary security groups.
 resource "openstack_networking_port_v2" "main-vm-port-${var.suffix}" {
   name       = "main-vm-port-${var.suffix}"
   network_id = data.openstack_networking_network_v2.sharednet3.id
@@ -67,18 +66,16 @@ resource "openstack_networking_port_v2" "main-vm-port-${var.suffix}" {
 }
 
 // COMPUTE INSTANCE
-// We spin up one CPU VM (no GPU needed for inference) on sharednet3, accessible via floating IP.
 resource "openstack_compute_instance_v2" "main-vm-${var.suffix}" {
   name        = "main-vm-${var.suffix}"
   image_name  = "CC-Ubuntu24.04"
-  flavor_name = "m1.medium" // Suitable for CPU-based inference
+  flavor_name = "m1.medium"
   key_pair    = var.key
 
   network {
     port = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
   }
 
-  // User data for first-boot initialization (load SSH keys, register hostname)
   user_data = <<-EOF
     #! /bin/bash
     sudo echo "127.0.1.1 main-vm-${var.suffix}" >> /etc/hosts
@@ -87,35 +84,32 @@ resource "openstack_compute_instance_v2" "main-vm-${var.suffix}" {
 }
 
 // FLOATING IP - FIRST TIME ONLY
-// This block creates a public IP and assigns it to VM so we can SSH or access APIs.
 resource "openstack_networking_floatingip_v2" "main-vm-floating-ip-${var.suffix}" {
   pool        = "public"
   description = "Floating IP for main-vm-${var.suffix}"
   port_id     = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
 }
 
-// OBJECT STORAGE CONTAINER (Swift)
-// This creates a Swift container for storing datasets or model artifacts.
-resource "openstack_objectstorage_container_v1" "objectstore-container-${var.suffix}" {
-  name = "objectstore-container-${var.suffix}"
+// OBJECT STORAGE (EXISTING CONTAINER CREATED BY FRIEND)
+data "openstack_objectstorage_container_v1" "objectstore-shared-container" {
+  provider = openstack.swift
+  name     = "object-persist-project19"
 }
 
-// BLOCK STORAGE VOLUME (Cinder)
-// This defines a 20GB persistent volume in the KVM@TACC zone.
+// BLOCK STORAGE VOLUME
 resource "openstack_blockstorage_volume_v3" "blockstorage-volume-${var.suffix}" {
   name              = "blockstorage-volume-${var.suffix}"
   size              = 20
   availability_zone = "KVM@TACC"
 }
 
-// ATTACH VOLUME TO VM
-// This attaches the block volume to the instance so it can be mounted in the OS.
+// VOLUME ATTACH TO VM
 resource "openstack_compute_volume_attach_v2" "blockstorage-volume-attach-${var.suffix}" {
   instance_id = openstack_compute_instance_v2["main-vm-${var.suffix}"].id
   volume_id   = openstack_blockstorage_volume_v3["blockstorage-volume-${var.suffix}"].id
 }
 
-// OUTPUTS FOR FIRST-TIME RUN
+// OUTPUTS
 output "vm_name" {
   value       = openstack_compute_instance_v2["main-vm-${var.suffix}"].name
   description = "Name of the deployed VM"
@@ -136,12 +130,39 @@ output "ssh_command" {
   description = "SSH command to connect to the VM"
 }
 
-output "object_storage_container" {
-  value       = openstack_objectstorage_container_v1["objectstore-container-${var.suffix}"].name
-  description = "Name of the created Swift object storage container"
+output "object_storage_container_name" {
+  value       = data.openstack_objectstorage_container_v1.objectstore-shared-container.name
+  description = "Referenced Swift container shared by teammate"
 }
 
 output "block_volume_name" {
   value       = openstack_blockstorage_volume_v3["blockstorage-volume-${var.suffix}"].name
   description = "Name of the persistent block volume"
 }
+
+// REUSE EXISTING FLOATING IP - OPTIONAL BLOCK
+# Uncomment below if you want to re-use a reserved floating IP after first apply
+
+# variable "floating_ip_address" {
+#   description = "Existing floating IP to use"
+#   default     = "129.114.27.242"  // Replace with your reserved IP
+# }
+
+# data "openstack_networking_floatingip_v2" "existing_ip" {
+#   address = var.floating_ip_address
+# }
+
+# resource "openstack_networking_floatingip_associate_v2" "main-vm-fip-association" {
+#   floating_ip = data.openstack_networking_floatingip_v2.existing_ip.address
+#   port_id     = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
+# }
+
+# output "floating_ip_address" {
+#   value       = data.openstack_networking_floatingip_v2.existing_ip.address
+#   description = "Reused IP to reach the VM"
+# }
+
+# output "ssh_command" {
+#   value       = "ssh cc@${data.openstack_networking_floatingip_v2.existing_ip.address}"
+#   description = "SSH command for reused IP"
+# }
