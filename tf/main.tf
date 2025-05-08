@@ -29,7 +29,7 @@ variable "suffix" {
 variable "key" {
   description = "Name of the SSH key pair registered in Chameleon"
   type        = string
-  default     = "id_rsa_chameleon"
+  default     = "group19-shared-key"
 }
 
 // DATA SOURCES
@@ -54,7 +54,7 @@ data "openstack_networking_secgroup_v2" "allow_9001" {
 }
 
 // NETWORKING PORT
-resource "openstack_networking_port_v2" "main-vm-port-${var.suffix}" {
+resource "openstack_networking_port_v2" "main_vm_port" {
   name       = "main-vm-port-${var.suffix}"
   network_id = data.openstack_networking_network_v2.sharednet3.id
   security_group_ids = [
@@ -66,14 +66,14 @@ resource "openstack_networking_port_v2" "main-vm-port-${var.suffix}" {
 }
 
 // COMPUTE INSTANCE
-resource "openstack_compute_instance_v2" "main-vm-${var.suffix}" {
+resource "openstack_compute_instance_v2" "main_vm" {
   name        = "main-vm-${var.suffix}"
   image_name  = "CC-Ubuntu24.04"
   flavor_name = "m1.medium"
   key_pair    = var.key
 
   network {
-    port = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
+    port = openstack_networking_port_v2.main_vm_port.id
   }
 
   user_data = <<-EOF
@@ -84,61 +84,68 @@ resource "openstack_compute_instance_v2" "main-vm-${var.suffix}" {
 }
 
 // FLOATING IP - FIRST TIME ONLY
-resource "openstack_networking_floatingip_v2" "main-vm-floating-ip-${var.suffix}" {
+resource "openstack_networking_floatingip_v2" "main_vm_floating_ip" {
   pool        = "public"
   description = "Floating IP for main-vm-${var.suffix}"
-  port_id     = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
+  port_id     = openstack_networking_port_v2.main_vm_port.id
 }
 
-// OBJECT STORAGE (EXISTING CONTAINER CREATED BY FRIEND)
-data "openstack_objectstorage_container_v1" "objectstore-shared-container" {
+// BLOCK STORAGE VOLUME
+resource "openstack_blockstorage_volume_v3" "blockstorage_volume" {
+  name = "blockstorage-volume-${var.suffix}"
+  size = 20
+  // availability_zone = "KVM@TACC"  // Commented because it's often unnecessary and may cause errors
+}
+
+// VOLUME ATTACH TO VM
+resource "openstack_compute_volume_attach_v2" "blockstorage_volume_attach" {
+  instance_id = openstack_compute_instance_v2.main_vm.id
+  volume_id   = openstack_blockstorage_volume_v3.blockstorage_volume.id
+}
+
+// creates a new object storage bucket for the project
+resource "openstack_objectstorage_container_v1" "objectstore_container" {
   provider = openstack.swift
   name     = "object-persist-project19"
 }
 
-// BLOCK STORAGE VOLUME
-resource "openstack_blockstorage_volume_v3" "blockstorage-volume-${var.suffix}" {
-  name              = "blockstorage-volume-${var.suffix}"
-  size              = 20
-  availability_zone = "KVM@TACC"
-}
-
-// VOLUME ATTACH TO VM
-resource "openstack_compute_volume_attach_v2" "blockstorage-volume-attach-${var.suffix}" {
-  instance_id = openstack_compute_instance_v2["main-vm-${var.suffix}"].id
-  volume_id   = openstack_blockstorage_volume_v3["blockstorage-volume-${var.suffix}"].id
-}
-
 // OUTPUTS
 output "vm_name" {
-  value       = openstack_compute_instance_v2["main-vm-${var.suffix}"].name
+  value       = openstack_compute_instance_v2.main_vm.name
   description = "Name of the deployed VM"
 }
 
 output "network_port_name" {
-  value       = openstack_networking_port_v2["main-vm-port-${var.suffix}"].name
+  value       = openstack_networking_port_v2.main_vm_port.name
   description = "Name of the VM's network port"
 }
 
 output "floating_ip_address" {
-  value       = openstack_networking_floatingip_v2["main-vm-floating-ip-${var.suffix}"].address
+  value       = openstack_networking_floatingip_v2.main_vm_floating_ip.address
   description = "Public IP to reach the VM"
 }
 
 output "ssh_command" {
-  value       = "ssh cc@${openstack_networking_floatingip_v2["main-vm-floating-ip-${var.suffix}"].address}"
+  value       = "ssh -i ~/.ssh/group19-shared-key cc@${openstack_networking_floatingip_v2.main_vm_floating_ip.address}"
   description = "SSH command to connect to the VM"
 }
 
-output "object_storage_container_name" {
-  value       = data.openstack_objectstorage_container_v1.objectstore-shared-container.name
-  description = "Referenced Swift container shared by teammate"
-}
-
 output "block_volume_name" {
-  value       = openstack_blockstorage_volume_v3["blockstorage-volume-${var.suffix}"].name
+  value       = openstack_blockstorage_volume_v3.blockstorage_volume.name
   description = "Name of the persistent block volume"
 }
+
+output "object_storage_container" {
+  value       = openstack_objectstorage_container_v1.objectstore_container.name
+  description = "Name of the object storage container"
+}
+
+
+output "ssh_key_used" {
+  value       = var.key
+  description = "SSH key name used for this deployment"
+}
+
 
 // REUSE EXISTING FLOATING IP - OPTIONAL BLOCK
 # Uncomment below if you want to re-use a reserved floating IP after first apply
@@ -152,9 +159,9 @@ output "block_volume_name" {
 #   address = var.floating_ip_address
 # }
 
-# resource "openstack_networking_floatingip_associate_v2" "main-vm-fip-association" {
+# resource "openstack_networking_floatingip_associate_v2" "main_vm_fip_association" {
 #   floating_ip = data.openstack_networking_floatingip_v2.existing_ip.address
-#   port_id     = openstack_networking_port_v2["main-vm-port-${var.suffix}"].id
+#   port_id     = openstack_networking_port_v2.main_vm_port.id
 # }
 
 # output "floating_ip_address" {
